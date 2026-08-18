@@ -25,6 +25,7 @@ qwen-vl-utils
 omegaconf
 numpy==1.26.4
 wandb
+swanlab
 rich
 diffusers
 timm

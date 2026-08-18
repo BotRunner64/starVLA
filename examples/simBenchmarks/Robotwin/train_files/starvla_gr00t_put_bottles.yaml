@@ -3,6 +3,11 @@ run_root_dir: results/Checkpoints
 seed: 42
 wandb_entity: your_wandb_entity
 wandb_project: starVLA_Robotwin
+tracker: swanlab
+swanlab_project: starVLA_Robotwin
+# Set this to your SwanLab username/team when needed; null uses the account default.
+swanlab_workspace: null
+swanlab_mode: online
 is_debug: false
 version_id: "0.21"
 

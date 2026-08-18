@@ -13,6 +13,7 @@ Conventions:
 # Standard Library
 import argparse
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -33,7 +34,6 @@ except ImportError:
 
 import wandb
 from accelerate import Accelerator, DeepSpeedPlugin
-from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
@@ -47,15 +47,25 @@ from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
-accelerator.print(accelerator.state)
-
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Initialize logger
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
+
+
+def create_accelerator(cfg) -> Accelerator:
+    """Create Accelerator after config loading so YAML accumulation is effective."""
+    gradient_accumulation_steps = int(cfg.trainer.get("gradient_accumulation_steps", 1))
+    if gradient_accumulation_steps < 1:
+        raise ValueError("trainer.gradient_accumulation_steps must be at least 1")
+
+    accelerator = Accelerator(
+        deepspeed_plugin=DeepSpeedPlugin(),
+        gradient_accumulation_steps=gradient_accumulation_steps,
+    )
+    accelerator.print(accelerator.state)
+    return accelerator
 
 
 def load_fast_tokenizer():
@@ -154,7 +164,7 @@ class VLATrainer(TrainerUtils):
             self.vla_train_dataloader,
         )
 
-        self._init_wandb()
+        self._init_tracker()
 
     def _calculate_total_batch_size(self):
         """Calculate global batch size."""
@@ -164,30 +174,50 @@ class VLATrainer(TrainerUtils):
             * self.accelerator.gradient_accumulation_steps
         )
 
-    def _init_wandb(self):
-        """Initialize Weights & Biases (best-effort; must not block training)."""
-        self._wandb_enabled = False
-        if os.environ.get("WANDB_MODE") == "disabled" or os.environ.get("WANDB_DISABLED", "").lower() in {
-            "1",
-            "true",
-            "yes",
-        }:
+    def _init_tracker(self):
+        """Initialize the configured experiment tracker on rank 0 (best effort)."""
+        self._tracker = None
+        tracker_name = str(getattr(self.config, "tracker", "wandb")).strip().lower()
+        if tracker_name in {"", "none", "disabled", "off"}:
+            self.accelerator.wait_for_everyone()
+            return
+        if tracker_name == "wandb" and (
+            os.environ.get("WANDB_MODE") == "disabled"
+            or os.environ.get("WANDB_DISABLED", "").lower() in {"1", "true", "yes"}
+        ):
             self.accelerator.wait_for_everyone()
             return
         if self.accelerator.is_main_process:
             try:
-                wandb.init(
-                    name=self.config.run_id,
-                    dir=os.path.join(self.config.output_dir, "wandb"),
-                    project=self.config.wandb_project,
-                    entity=self.config.wandb_entity,
-                    group="vla-train",
-                )
-                self._wandb_enabled = True
+                if tracker_name == "wandb":
+                    wandb.init(
+                        name=self.config.run_id,
+                        dir=os.path.join(self.config.output_dir, "wandb"),
+                        project=self.config.wandb_project,
+                        entity=self.config.wandb_entity,
+                        group="vla-train",
+                    )
+                    self._tracker = wandb
+                elif tracker_name == "swanlab":
+                    import swanlab
+
+                    init_kwargs = {
+                        "project": getattr(self.config, "swanlab_project", self.config.wandb_project),
+                        "name": self.config.run_id,
+                        "log_dir": os.path.join(self.config.output_dir, "swanlog"),
+                        "mode": str(getattr(self.config, "swanlab_mode", "online")),
+                    }
+                    workspace = getattr(self.config, "swanlab_workspace", None)
+                    if workspace and str(workspace) not in {"null", "None"}:
+                        init_kwargs["workspace"] = str(workspace)
+                    swanlab.init(**init_kwargs)
+                    self._tracker = swanlab
+                else:
+                    raise ValueError(f"Unsupported tracker {tracker_name!r}; use wandb, swanlab, or disabled")
             except Exception as exc:
-                logger.warning(f"W&B init failed; continuing without W&B: {exc}")
-                self._wandb_enabled = False
-        # Rendezvous after rank-0 W&B init. Otherwise a slow or failing init on
+                logger.warning(f"{tracker_name} init failed; continuing without a tracker: {exc}")
+                self._tracker = None
+        # Rendezvous after rank-0 tracker init. Otherwise a slow or failing init on
         # rank 0 lets the other ranks reach the first collective alone and
         # eventually hit an NCCL watchdog timeout.
         self.accelerator.wait_for_everyone()
@@ -298,12 +328,12 @@ class VLATrainer(TrainerUtils):
                 group_name = group.get("name", str(i))
                 metrics[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
             metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
-            if getattr(self, "_wandb_enabled", False):
+            if getattr(self, "_tracker", None) is not None:
                 try:
-                    wandb.log(metrics, step=self.completed_steps)
+                    self._tracker.log(metrics, step=self.completed_steps)
                 except Exception as exc:
-                    self._wandb_enabled = False
-                    logger.warning(f"W&B log failed; disabling W&B: {exc}")
+                    logger.warning(f"Tracker log failed; disabling tracker: {exc}")
+                    self._tracker = None
             logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
     def _create_data_iterators(self):
@@ -343,10 +373,6 @@ class VLATrainer(TrainerUtils):
             step_metrics = self._train_step(batch_vla)
             t_end_model = time.perf_counter()
 
-            if self.accelerator.sync_gradients:
-                progress_bar.update(1)
-                self.completed_steps += 1
-
             if self.accelerator.is_local_main_process:
                 progress_bar.set_postfix(
                     {
@@ -355,15 +381,22 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+            # Metrics, evaluation, and checkpoints are optimizer-step events.
+            # Running them on accumulation microsteps duplicates work and may
+            # overwrite the same checkpoint several times.
+            if self.accelerator.sync_gradients:
+                progress_bar.update(1)
+                self.completed_steps += 1
 
-            step_metrics["timing/data"] = t_end_data - t_start_data
-            step_metrics["timing/model"] = t_end_model - t_start_model
-            self._log_metrics(step_metrics)
+                if self.completed_steps % self.config.trainer.eval_interval == 0:
+                    step_metrics = self.eval_action_model(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
-                self._save_checkpoint()
+                step_metrics["timing/data"] = t_end_data - t_start_data
+                step_metrics["timing/model"] = t_end_model - t_start_model
+                self._log_metrics(step_metrics)
+
+                if self.completed_steps % self.config.trainer.save_interval == 0:
+                    self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
                 break
@@ -444,9 +477,9 @@ class VLATrainer(TrainerUtils):
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
-        if self.accelerator.is_main_process and getattr(self, "_wandb_enabled", False):
+        if self.accelerator.is_main_process and getattr(self, "_tracker", None) is not None:
             try:
-                wandb.finish()
+                self._tracker.finish()
             except Exception:
                 pass
 
@@ -458,6 +491,15 @@ def main(cfg) -> None:
 
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
+
+    accelerator = create_accelerator(cfg)
+
+    if cfg.is_debug and accelerator.is_main_process:
+        import debugpy
+
+        debugpy.listen(("0.0.0.0", 10092))
+        print("🔍 Rank 0 waiting for debugger attach on port 10092...")
+        debugpy.wait_for_client()
 
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
@@ -504,12 +546,5 @@ if __name__ == "__main__":
 
     # Store source config path for later copying to output dir
     cfg.config_yaml = args.config_yaml
-
-    if cfg.is_debug and dist.is_initialized() and dist.get_rank() == 0:
-        import debugpy
-
-        debugpy.listen(("0.0.0.0", 10092))
-        print("🔍 Rank 0 waiting for debugger attach on port 10092...")
-        debugpy.wait_for_client()
 
     main(cfg)

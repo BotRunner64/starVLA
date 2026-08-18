@@ -58,6 +58,40 @@ assert dataloader == [1, 2, 3]
 """,
         )
 
+    def test_train_starvla_accelerator_uses_configured_gradient_accumulation(self):
+        import importlib
+        import types
+        from unittest import mock
+
+        module = importlib.import_module("starVLA.training.train_starvla")
+        cfg = types.SimpleNamespace(
+            trainer={"gradient_accumulation_steps": 8},
+        )
+        fake_accelerator = types.SimpleNamespace(print=mock.Mock(), state="state")
+        with (
+            mock.patch.object(module, "DeepSpeedPlugin", return_value="plugin") as plugin_cls,
+            mock.patch.object(module, "Accelerator", return_value=fake_accelerator) as accelerator_cls,
+        ):
+            result = module.create_accelerator(cfg)
+
+        self.assertIs(result, fake_accelerator)
+        plugin_cls.assert_called_once_with()
+        accelerator_cls.assert_called_once_with(
+            deepspeed_plugin="plugin",
+            gradient_accumulation_steps=8,
+        )
+
+    def test_train_starvla_accelerator_rejects_invalid_gradient_accumulation(self):
+        import importlib
+        import types
+
+        module = importlib.import_module("starVLA.training.train_starvla")
+        cfg = types.SimpleNamespace(
+            trainer={"gradient_accumulation_steps": 0},
+        )
+        with self.assertRaisesRegex(ValueError, "must be at least 1"):
+            module.create_accelerator(cfg)
+
     def test_train_starvlm_prepare_data_safe_without_process_group(self):
         self._run_prepare_data_subprocess(
             """
